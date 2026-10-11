@@ -7,7 +7,8 @@ Env:  MONGO_URI, MONGO_DB. A local .env is loaded for convenience, but real
 """
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -78,23 +79,111 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 
 
 # --------------------------------------------------------------------------- #
-# Helpers  (STARTER - not reviewed yet)
+# Constants
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+PRESENCE_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}   # R6: these count as present
+GRACE_SECONDS = 10 * 60                              # R2: 10 minute grace period
+MIN_OVERTIME_MINUTES = 30                            # R3: overtime counts from 30 min
+HALF_DAY_HOURS = 4.5                                 # R5: below this is a half day
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+# --------------------------------------------------------------------------- #
+# Helpers - time conversion and rounding
+# --------------------------------------------------------------------------- #
+def ms_to_dt(ms: int) -> datetime:
+    """Epoch milliseconds (API) -> aware UTC datetime (MongoDB)."""
+    return EPOCH + timedelta(milliseconds=ms)
+
+
+def dt_to_ms(dt: Optional[datetime]) -> Optional[int]:
+    """Aware datetime (MongoDB) -> epoch milliseconds (API). None stays None."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:  # defensive: treat a naive value as UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - EPOCH) // timedelta(milliseconds=1)  # integer maths, no float error
+
+
+def truncate_to_second(dt: datetime) -> datetime:
+    """R1: 09:40:00.900 counts as 09:40:00."""
+    return dt.replace(microsecond=0)
+
+
+def round_half_up(value, places: int) -> float:
+    """R4/R8: half-up rounding (2.345 -> 2.35), unlike Python's round()."""
+    quantum = Decimal(1).scaleb(-places)  # places=2 -> Decimal("0.01")
+    return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
+
+
+# --------------------------------------------------------------------------- #
+# Helpers - shifts and business rules R1 - R5
+# --------------------------------------------------------------------------- #
+def parse_hhmm(value: str) -> time:
+    h, m = map(int, value.split(":"))
+    return time(h, m)
+
+
+def is_overnight(shift_start: str, shift_end: str) -> bool:
+    """R1: shift_end <= shift_start means the shift crosses midnight."""
+    return parse_hhmm(shift_end) <= parse_hhmm(shift_start)
+
+
+def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> date:
+    """R1: the IST calendar date of punch_in; for an overnight shift a punch-in
+    earlier than shift_end belongs to the shift that started the day before."""
+    local = punch_in.astimezone(IST)
+    if is_overnight(shift_start, shift_end) and local.time() < parse_hhmm(shift_end):
+        return local.date() - timedelta(days=1)
+    return local.date()
+
+
+def shift_start_at(att_date: date, shift_start: str) -> datetime:
+    """The instant the shift starts: shift_start (IST) on the attendance date."""
+    return datetime.combine(att_date, parse_hhmm(shift_start), tzinfo=IST)
+
+
+def shift_end_at(att_date: date, shift_start: str, shift_end: str) -> datetime:
+    """The instant the shift ends; an overnight shift ends on the next day."""
+    end_day = att_date + timedelta(days=1) if is_overnight(shift_start, shift_end) else att_date
+    return datetime.combine(end_day, parse_hhmm(shift_end), tzinfo=IST)
+
+
+def compute_late_minutes(punch_in: datetime, att_date: date, shift_start: str) -> int:
+    """R2: late only if strictly more than 10:00 after shift start; then whole
+    minutes (floor) since shift start. 09:40:00 -> 0, 09:40:01 -> 10."""
+    seconds = int((punch_in - shift_start_at(att_date, shift_start)).total_seconds())
+    return seconds // 60 if seconds > GRACE_SECONDS else 0
+
+
+def compute_overtime(punch_out: datetime, att_date: date, shift_start: str, shift_end: str) -> int:
+    """R3: whole minutes (floor) from shift end to punch-out, only if >= 30."""
+    seconds = int((punch_out - shift_end_at(att_date, shift_start, shift_end)).total_seconds())
+    minutes = seconds // 60 if seconds > 0 else 0
+    return minutes if minutes >= MIN_OVERTIME_MINUTES else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    """R4: (punch_out - punch_in) seconds / 3600, 2 decimals half-up."""
+    seconds = int((punch_out - punch_in).total_seconds())
+    return float((Decimal(seconds) / Decimal(3600)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def derived_fields(status: str, punch_in: Optional[datetime], punch_out: Optional[datetime],
+                   att_date: date, emp: dict) -> dict:
+    """The four computed fields for a record, following the table in DATA_MODEL.md."""
+    if status not in PRESENCE_STATUSES or punch_in is None:
+        return {"work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    late = compute_late_minutes(punch_in, att_date, emp["shift_start"])
+    if punch_out is None:
+        return {"work_hours": None, "late_minutes": late, "overtime_minutes": 0, "half_day": False}
+    hours = compute_work_hours(punch_in, punch_out)
+    return {
+        "work_hours": hours,
+        "late_minutes": late,
+        "overtime_minutes": compute_overtime(punch_out, att_date, emp["shift_start"], emp["shift_end"]),
+        "half_day": hours < HALF_DAY_HOURS,  # R5: compared on the ROUNDED hours
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -166,7 +255,7 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": 0,  # TEMP: starter punch-in is rewritten in a later step
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
