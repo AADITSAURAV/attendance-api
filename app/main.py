@@ -1,34 +1,84 @@
 """
-Employee Attendance & Analytics API - STARTER
+Employee Attendance & Analytics API
 
 Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
-
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
+Env:  MONGO_URI, MONGO_DB. A local .env is loaded for convenience, but real
+      environment variables always take priority over it.
 """
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from pymongo import MongoClient
+from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient
+from pymongo.errors import PyMongoError
 
-load_dotenv()
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+# override=False (the default): if a variable is already set in the real
+# environment, the value in .env does NOT replace it.
+load_dotenv(override=False)
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
-db = client[os.getenv("MONGO_DB", "attendance_db")]
+MONGO_URI = os.environ.get("MONGO_URI")
+MONGO_DB = os.environ.get("MONGO_DB")
+if not MONGO_URI or not MONGO_DB:
+    raise RuntimeError("MONGO_URI and MONGO_DB must be set (environment or .env)")
+
+# tz_aware=True -> PyMongo returns timezone-aware UTC datetimes, not naive ones.
+# serverSelectionTimeoutMS -> fail after 5 s instead of the default 30 s.
+client = MongoClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=5000)
+db = client[MONGO_DB]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+# --------------------------------------------------------------------------- #
+# Indexes - created at startup. create_indexes() is idempotent: running it
+# again with the same definitions changes nothing.
+# --------------------------------------------------------------------------- #
+INDEXES = {
+    "employees": [
+        # Uniqueness of emp_code is enforced by the database (race-safe create).
+        IndexModel([("emp_code", ASCENDING)], name="uniq_emp_code", unique=True),
+        # Department filter + joined_on (headcount, trend).
+        IndexModel([("department", ASCENDING), ("joined_on", ASCENDING)], name="department_joined_on"),
+        # joined_on alone (department summary without a department filter).
+        IndexModel([("joined_on", ASCENDING)], name="joined_on"),
+    ],
+    "attendance_logs": [
+        # One record per employee per day; makes concurrent punch-ins race-safe.
+        IndexModel([("emp_code", ASCENDING), ("date", ASCENDING)], name="uniq_emp_code_date", unique=True),
+        # Punch-out: "latest record of this employee with punch_in <= t".
+        IndexModel([("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="emp_code_punch_in"),
+        # Listing sorted by date desc, emp_code asc; month ranges in analytics.
+        IndexModel([("date", DESCENDING), ("emp_code", ASCENDING)], name="date_emp_code"),
+        # Listing filtered by status.
+        IndexModel([("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)], name="status_date_emp_code"),
+    ],
+}
+
+
+def create_indexes() -> None:
+    for collection_name, models in INDEXES.items():
+        db[collection_name].create_indexes(models)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    create_indexes()  # runs once, before the first request is served
+    yield
+    client.close()
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# Helpers  (STARTER - not reviewed yet)
 # --------------------------------------------------------------------------- #
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
@@ -48,7 +98,7 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Models
+# Models  (STARTER - not reviewed yet)
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
     emp_code: str
@@ -67,13 +117,19 @@ class PunchInIn(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Endpoints provided
+# Endpoints
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    # 200 only if MongoDB actually answers a ping; otherwise 503.
+    try:
+        client.admin.command("ping")
+    except PyMongoError:
+        raise HTTPException(status_code=503, detail="database unavailable")
     return {"status": "ok"}
 
 
+# ----- STARTER endpoints below - not reviewed yet --------------------------- #
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     if db.employees.find_one({"emp_code": body.emp_code}):
