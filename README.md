@@ -1,26 +1,27 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+FastAPI + MongoDB (PyMongo). All application code is in `app/main.py`.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
-
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
-
-## Local setup
+## Run
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
+cp .env.example .env                                  # set MONGO_URI / MONGO_DB (real env vars take priority)
+python sample_seed.py                                 # optional: the kit's nine sample documents
+uvicorn app.main:app --port 8000
 ```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
+Requires MongoDB 6.0+ (developed and tested on 7.0). Indexes are created automatically at startup.
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+## Checks (not part of the app; need the server running)
+- `python scripts/check_rules.py` - business rules R1-R5 against the spec's examples and the sample data (no server needed).
+- `python scripts/check_api.py` - CRUD, validation, status codes, concurrency (parallel punch-in/out/PATCH).
+- `python scripts/check_analytics.py` - builds an awkward dataset and compares all analytics with an independent Python implementation; checks explain plans.
+- `python scripts/load_test.py` - seeds ~100,000 records and times every endpoint + explain (`--cleanup` removes them).
+
+## Interpretations (where the spec left room)
+- Records dated before an employee's `joined_on` are counted as stored; only `working_days` starts at `joined_on` (R7).
+- Department summary includes only employees who joined by the month's end (R9); their logs are the department's logs.
+- Trend range limit: more than 92 days counted inclusively -> 422.
+- A PATCH "changes nothing" when no tracked field (including recomputed derived fields) would change -> 422.
+- Overnight shift: a punch-in exactly at `shift_end` belongs to that day (the rule says "earlier than").
+- Attendance rates are rounded half-up to 4 decimals; the 7-day moving average is the mean of those reported rates.
