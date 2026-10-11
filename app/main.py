@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, Field, StrictInt, model_validator
-from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient
+from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +86,7 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 PRESENCE_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}   # R6: these count as present
 GRACE_SECONDS = 10 * 60                              # R2: 10 minute grace period
 MIN_OVERTIME_MINUTES = 30                            # R3: overtime counts from 30 min
+MAX_SHIFT = timedelta(hours=24)                      # punch-out at most 24 h after punch-in
 HALF_DAY_HOURS = 4.5                                 # R5: below this is a half day
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -234,6 +235,21 @@ class PunchInRequest(BaseModel):
     status: PresenceStatus = "PRESENT"         # ABSENT / LEAVE are rejected (422)
 
 
+class PunchOutRequest(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMillis] = None   # omitted -> now
+
+
+class RegularizeRequest(BaseModel):
+    """Only these fields can be changed. Anything else in the body (for example
+    late_minutes or work_hours) is ignored - derived fields are always recomputed."""
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMillis] = None
+    punch_out: Optional[EpochMillis] = None
+    reason: Annotated[str, Field(min_length=5, max_length=200)]
+    regularized_by: Annotated[str, Field(min_length=1, max_length=50)]
+
+
 # --------------------------------------------------------------------------- #
 # Response serializers - build the API shape explicitly (never leak _id)
 # --------------------------------------------------------------------------- #
@@ -361,6 +377,118 @@ def punch_in(body: PunchInRequest):
     return record_out(doc)
 
 
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutRequest):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="employee not found")
+
+    instant = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
+    punched = truncate_to_second(instant)  # R1
+
+    # The employee's most recent record whose punch_in is at or before this
+    # punch-out (index emp_code_punch_in). This also finds yesterday's record
+    # when an overnight shift is closed after midnight.
+    record = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": punched}},
+        sort=[("punch_in", DESCENDING)],
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="no punch-in found")
+    if record.get("punch_out") is not None:
+        raise HTTPException(status_code=409, detail="already punched out")
+    if punched <= record["punch_in"]:
+        raise validation_error("punched_at", "body", "punch-out must be after punch-in", body.punched_at)
+    if punched - record["punch_in"] > MAX_SHIFT:
+        raise validation_error("punched_at", "body", "punch-out is more than 24 hours after punch-in",
+                               body.punched_at)
+
+    att_date = date.fromisoformat(record["date"])
+    derived = derived_fields(record["status"], record["punch_in"], punched, att_date, emp)  # R3-R5
+
+    # Race-safe: the filter only matches while punch_out is still null, so of
+    # two simultaneous punch-outs exactly one gets the document back.
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": record["_id"], "punch_out": None},
+        {"$set": {"punch_out": punched, **derived}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(status_code=409, detail="already punched out")
+    return record_out(updated)
+
+
+# Fields compared for history[].changes, with the value a missing field means.
+TRACKED_FIELDS = {
+    "status": None, "punch_in": None, "punch_out": None, "work_hours": None,
+    "late_minutes": 0, "overtime_minutes": 0, "half_day": False,
+}
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: DateStr, body: RegularizeRequest):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="employee not found")
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if record is None:
+        raise HTTPException(status_code=404, detail="no attendance record for this date")
+    att_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+    # 1. Final values of the editable fields (omitted -> unchanged).
+    new_status = body.status or record["status"]
+    if new_status not in PRESENCE_STATUSES:
+        # ABSENT / LEAVE clear both punch times; supplying one is a contradiction.
+        if body.punch_in is not None or body.punch_out is not None:
+            raise validation_error("status", "body", f"{new_status} cannot have punch times", new_status)
+        new_in = new_out = None
+    else:
+        new_in = truncate_to_second(ms_to_dt(body.punch_in)) if body.punch_in is not None else record.get("punch_in")
+        new_out = truncate_to_second(ms_to_dt(body.punch_out)) if body.punch_out is not None else record.get("punch_out")
+        if new_in is None:
+            raise validation_error("punch_in", "body", "a presence status requires punch_in", None)
+        if body.punch_in is not None and attendance_date(new_in, emp["shift_start"], emp["shift_end"]) != att_date:
+            raise validation_error("punch_in", "body", "punch_in must stay on the record's attendance date (R1)",
+                                   body.punch_in)
+        if new_out is not None and not (new_in < new_out <= new_in + MAX_SHIFT):
+            raise validation_error("punch_out", "body", "punch_out must be after punch_in and within 24 hours",
+                                   body.punch_out)
+
+    # 2. Recompute every derived field from the final values (R2-R5).
+    new_values = {"status": new_status, "punch_in": new_in, "punch_out": new_out,
+                  **derived_fields(new_status, new_in, new_out, att_date, emp)}
+
+    # 3. Only fields whose value actually changes go into the audit entry.
+    changes = {}
+    for field, missing in TRACKED_FIELDS.items():
+        before = record.get(field, missing)
+        if before != new_values[field]:
+            changes[field] = {"from": before, "to": new_values[field]}
+    if not changes:
+        raise validation_error("body", "body", "the request changes nothing", None)
+
+    entry = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+
+    # 4. Optimistic concurrency: update only if the record is still exactly as we
+    #    read it (same editable fields, same number of history entries). If a
+    #    concurrent correction got there first, this matches nothing -> 409, so
+    #    no history entry is ever silently lost. $push appends, never overwrites.
+    guard = {"_id": record["_id"], "status": record["status"],
+             "punch_in": record.get("punch_in"), "punch_out": record.get("punch_out")}
+    if "history" in record:
+        guard["history"] = {"$size": len(record["history"] or [])}
+    else:
+        guard["history"] = {"$exists": False}   # legacy record without history
+    updated = db.attendance_logs.find_one_and_update(
+        guard,
+        {"$set": new_values, "$push": {"history": entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(status_code=409, detail="record was changed by another request; retry")
+    return record_out(updated)
+
+
 ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
 
 
@@ -407,8 +535,6 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late

@@ -209,6 +209,132 @@ if body.get("total") == 1:  # only when the kit's sample data is loaded
           (legacy["history"], legacy["half_day"]), ([], False))
 
 # --------------------------------------------------------------------------- #
+print("--- POST /attendance/punch-out ---")
+# DAY_EMP has open records on day(0) (in 10:15:59, late 45) and day(1) (WFH, in 09:40).
+status, rec = call("POST", "/attendance/punch-out", {"emp_code": DAY_EMP, "punched_at": ist_ms(day(1), 13, 0)})
+check("closes the most recent record (day 1)", (status, rec.get("date")), (200, day(1).isoformat()))
+check("R4 work 3h20m -> 3.33, R5 half day, R3 no overtime",
+      [rec.get(k) for k in ("work_hours", "half_day", "overtime_minutes", "late_minutes")], [3.33, True, 0, 0])
+check("punch_out returned as epoch ms", rec.get("punch_out"), ist_ms(day(1), 13, 0))
+
+status, rec = call("POST", "/attendance/punch-out", {"emp_code": DAY_EMP, "punched_at": ist_ms(day(0), 19, 30)})
+check("punch_in <= punched_at picks day 0", (status, rec.get("date")), (200, day(0).isoformat()))
+check("R4 9h14m01s -> 9.23, R3 overtime 60, late kept 45",
+      [rec.get(k) for k in ("work_hours", "overtime_minutes", "late_minutes", "half_day")], [9.23, 60, 45, False])
+check("history untouched by punch-out", rec.get("history"), [])
+check("already punched out -> 409",
+      call("POST", "/attendance/punch-out", {"emp_code": DAY_EMP, "punched_at": ist_ms(day(0), 20, 0)})[0], 409)
+
+status, rec = call("POST", "/attendance/punch-out", {"emp_code": NIGHT_EMP, "punched_at": ist_ms(day(1), 6, 40)})
+check("overnight: closes across midnight", (status, rec.get("date")), (200, day(0).isoformat()))
+check("overnight: work 5.67, overtime 40",
+      [rec.get(k) for k in ("work_hours", "overtime_minutes")], [5.67, 40])
+
+check("unknown employee -> 404",
+      call("POST", "/attendance/punch-out", {"emp_code": "EMP000000", "punched_at": ist_ms(day(0), 18, 0)})[0], 404)
+code_nolog = emp_code(6)
+call("POST", "/employees", new_employee(code_nolog))
+check("employee with no punch-in -> 404",
+      call("POST", "/attendance/punch-out", {"emp_code": code_nolog, "punched_at": ist_ms(day(0), 18, 0)})[0], 404)
+
+call("POST", "/attendance/punch-in", {"emp_code": code_nolog, "punched_at": ist_ms(day(3), 9, 0)})
+check("punch-out before any punch-in -> 404",
+      call("POST", "/attendance/punch-out", {"emp_code": code_nolog, "punched_at": ist_ms(day(2), 18, 0)})[0], 404)
+check("punched_at == punch_in -> 422",
+      call("POST", "/attendance/punch-out", {"emp_code": code_nolog, "punched_at": ist_ms(day(3), 9, 0)})[0], 422)
+check("more than 24 h after punch_in -> 422",
+      call("POST", "/attendance/punch-out", {"emp_code": code_nolog, "punched_at": ist_ms(day(4), 9, 0, 1)})[0], 422)
+check("punched_at in seconds -> 422",
+      call("POST", "/attendance/punch-out", {"emp_code": code_nolog, "punched_at": ist_ms(day(3), 18, 0) // 1000})[0], 422)
+check("valid punch-out after those errors -> 200",
+      call("POST", "/attendance/punch-out", {"emp_code": code_nolog, "punched_at": ist_ms(day(3), 18, 30)})[0], 200)
+
+print("--- concurrent punch-outs ---")
+code_race3 = emp_code(7)
+call("POST", "/employees", new_employee(code_race3))
+call("POST", "/attendance/punch-in", {"emp_code": code_race3, "punched_at": ist_ms(day(3), 9, 0)})
+with ThreadPoolExecutor(max_workers=10) as pool:
+    statuses = sorted(pool.map(lambda _: call("POST", "/attendance/punch-out",
+                                              {"emp_code": code_race3, "punched_at": ist_ms(day(3), 18, 0)})[0],
+                               range(10)))
+check("10 parallel punch-outs: one 200, nine 409", statuses, [200] + [409] * 9)
+
+# --------------------------------------------------------------------------- #
+print("--- PATCH /attendance/{emp_code}/{date} ---")
+REG = emp_code(8)
+call("POST", "/employees", new_employee(REG))
+D5 = day(5).isoformat()
+call("POST", "/attendance/punch-in", {"emp_code": REG, "punched_at": ist_ms(day(5), 10, 5)})
+status, rec = call("POST", "/attendance/punch-out", {"emp_code": REG, "punched_at": ist_ms(day(5), 18, 40)})
+check("setup: late 35, work 8.58, no overtime",
+      [rec.get(k) for k in ("late_minutes", "work_hours", "overtime_minutes")], [35, 8.58, 0])
+
+
+def regularize(payload, code=REG, d=D5):
+    body = {"reason": "biometric glitch", "regularized_by": "hr.admin"}
+    body.update(payload)
+    return call("PATCH", f"/attendance/{code}/{d}", body)
+
+
+status, rec = regularize({"punch_in": ist_ms(day(5), 9, 28)})
+check("fix punch_in -> 200", status, 200)
+check("derived recomputed: late 0, work 9.2", [rec.get("late_minutes"), rec.get("work_hours")], [0, 9.2])
+hist = rec.get("history", [])
+check("one history entry appended", len(hist), 1)
+entry = hist[0] if hist else {}
+check("entry has at/by/reason/changes", sorted(entry), ["at", "by", "changes", "reason"])
+check("entry.by / reason", (entry.get("by"), entry.get("reason")), ("hr.admin", "biometric glitch"))
+check("entry.at is epoch ms", isinstance(entry.get("at"), int) and entry["at"] > 10**11, True)
+check("only changed fields recorded", sorted(entry.get("changes", {})), ["late_minutes", "punch_in", "work_hours"])
+check("punch_in from/to are epoch ms", entry.get("changes", {}).get("punch_in"),
+      {"from": ist_ms(day(5), 10, 5), "to": ist_ms(day(5), 9, 28)})
+check("late_minutes from/to", entry.get("changes", {}).get("late_minutes"), {"from": 35, "to": 0})
+
+check("same value again (changes nothing) -> 422", regularize({"punch_in": ist_ms(day(5), 9, 28)})[0], 422)
+check("only reason + regularized_by -> 422", regularize({})[0], 422)
+
+status, rec = regularize({"punch_out": ist_ms(day(5), 19, 15), "late_minutes": 999, "work_hours": 1})
+check("fix punch_out: overtime 45, work 9.78 (client-sent derived values ignored)",
+      [status, rec.get("overtime_minutes"), rec.get("work_hours"), rec.get("late_minutes")], [200, 45, 9.78, 0])
+check("history appended, first entry kept", [len(rec.get("history", [])), rec["history"][0]["reason"]],
+      [2, "biometric glitch"])
+
+check("LEAVE with a punch time -> 422", regularize({"status": "LEAVE", "punch_in": ist_ms(day(5), 9, 0)})[0], 422)
+status, rec = regularize({"status": "LEAVE", "reason": "approved leave"})
+check("set LEAVE -> punches cleared, derived reset",
+      [status] + [rec.get(k) for k in ("status", "punch_in", "punch_out", "work_hours", "late_minutes",
+                                       "overtime_minutes", "half_day")],
+      [200, "LEAVE", None, None, None, 0, 0, False])
+check("LEAVE entry changes", sorted(rec["history"][-1]["changes"]),
+      ["overtime_minutes", "punch_in", "punch_out", "status", "work_hours"])
+check("presence status without any punch_in -> 422", regularize({"status": "PRESENT"})[0], 422)
+status, rec = regularize({"status": "WFH", "punch_in": ist_ms(day(5), 9, 50)})
+check("back to WFH with punch_in: late 20, still open",
+      [status, rec.get("status"), rec.get("late_minutes"), rec.get("punch_out"), rec.get("work_hours"),
+       len(rec.get("history", []))], [200, "WFH", 20, None, None, 4])
+
+check("punch_in on another date (R1) -> 422", regularize({"punch_in": ist_ms(day(6), 9, 0)})[0], 422)
+check("punch_out before punch_in -> 422", regularize({"punch_out": ist_ms(day(5), 9, 0)})[0], 422)
+check("punch_out > 24 h after punch_in -> 422", regularize({"punch_out": ist_ms(day(6), 10, 0)})[0], 422)
+check("reason too short -> 422", regularize({"punch_out": ist_ms(day(5), 18, 0), "reason": "bad"})[0], 422)
+check("missing regularized_by -> 422",
+      call("PATCH", f"/attendance/{REG}/{D5}", {"punch_out": ist_ms(day(5), 18, 0), "reason": "valid reason"})[0], 422)
+check("punch_out in seconds -> 422", regularize({"punch_out": ist_ms(day(5), 18, 0) // 1000})[0], 422)
+check("unknown employee -> 404", regularize({"status": "ABSENT"}, code="EMP000000")[0], 404)
+check("no record for that date -> 404", regularize({"status": "ABSENT"}, d=day(9).isoformat())[0], 404)
+check("invalid date in path -> 422", regularize({"status": "ABSENT"}, d="2026-13-01")[0], 422)
+
+print("--- concurrent corrections ---")
+before = len(call("GET", f"/attendance?emp_code={REG}")[1]["items"][0]["history"])
+with ThreadPoolExecutor(max_workers=6) as pool:
+    results = list(pool.map(lambda i: regularize({"punch_out": ist_ms(day(5), 18, 30 + i),
+                                                  "reason": f"parallel fix {i}"})[0], range(6)))
+after = call("GET", f"/attendance?emp_code={REG}")[1]["items"][0]["history"]
+check("every response is 200 or 409", all(s in (200, 409) for s in results), True)
+check("at least one succeeded", results.count(200) >= 1, True)
+check("no lost history: one entry per 200", len(after) - before, results.count(200))
+
+# --------------------------------------------------------------------------- #
 print()
 print("ALL PASSED" if failures == 0 else f"{failures} FAILED")
 sys.exit(1 if failures else 0)
