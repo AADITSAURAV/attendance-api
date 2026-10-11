@@ -146,7 +146,7 @@ check("defaults: status/punch_out/work_hours/overtime/half_day/history",
 check("second punch-in same day -> 409",
       call("POST", "/attendance/punch-in", {"emp_code": DAY_EMP, "punched_at": ist_ms(day(0), 11, 0)})[0], 409)
 check("unknown employee -> 404",
-      call("POST", "/attendance/punch-in", {"emp_code": "EMP000000", "punched_at": ist_ms(day(0), 9, 0)})[0], 404)
+      call("POST", "/attendance/punch-in", {"emp_code": "EMP_NOPE", "punched_at": ist_ms(day(0), 9, 0)})[0], 404)
 
 bad_punches = {
     "status ABSENT": {"emp_code": DAY_EMP, "status": "ABSENT"},
@@ -231,7 +231,7 @@ check("overnight: work 5.67, overtime 40",
       [rec.get(k) for k in ("work_hours", "overtime_minutes")], [5.67, 40])
 
 check("unknown employee -> 404",
-      call("POST", "/attendance/punch-out", {"emp_code": "EMP000000", "punched_at": ist_ms(day(0), 18, 0)})[0], 404)
+      call("POST", "/attendance/punch-out", {"emp_code": "EMP_NOPE", "punched_at": ist_ms(day(0), 18, 0)})[0], 404)
 code_nolog = emp_code(6)
 call("POST", "/employees", new_employee(code_nolog))
 check("employee with no punch-in -> 404",
@@ -320,7 +320,7 @@ check("reason too short -> 422", regularize({"punch_out": ist_ms(day(5), 18, 0),
 check("missing regularized_by -> 422",
       call("PATCH", f"/attendance/{REG}/{D5}", {"punch_out": ist_ms(day(5), 18, 0), "reason": "valid reason"})[0], 422)
 check("punch_out in seconds -> 422", regularize({"punch_out": ist_ms(day(5), 18, 0) // 1000})[0], 422)
-check("unknown employee -> 404", regularize({"status": "ABSENT"}, code="EMP000000")[0], 404)
+check("unknown employee -> 404", regularize({"status": "ABSENT"}, code="EMP_NOPE")[0], 404)
 check("no record for that date -> 404", regularize({"status": "ABSENT"}, d=day(9).isoformat())[0], 404)
 check("invalid date in path -> 422", regularize({"status": "ABSENT"}, d="2026-13-01")[0], 422)
 

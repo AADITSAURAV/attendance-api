@@ -238,7 +238,7 @@ check("hand-checked A: present 4.5, leave 1, late 4 = 180 min, overtime 40",
 check("F: working_days 0 -> attendance_pct null",
       [got_f.get("working_days"), got_f.get("attendance_pct")] if (got_f := call(
           "GET", f"/analytics/employees/{F}/monthly?month={MONTH}")[1]) else None, [0, None])
-check("unknown employee -> 404", call("GET", f"/analytics/employees/EMP000000/monthly?month={MONTH}")[0], 404)
+check("unknown employee -> 404", call("GET", f"/analytics/employees/EMP_NOPE/monthly?month={MONTH}")[0], 404)
 check("bad month -> 422", call("GET", f"/analytics/employees/{A}/monthly?month={YEAR}-13")[0], 422)
 
 print("--- department summary ---")
