@@ -10,10 +10,11 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 import re
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, Field, StrictInt, model_validator
 from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
@@ -223,10 +224,14 @@ class EmployeeCreate(BaseModel):
         return self
 
 
-class PunchInIn(BaseModel):  # STARTER - not reviewed yet
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+PresenceStatus = Literal["PRESENT", "WFH", "ON_DUTY"]
+
+
+class PunchInRequest(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[EpochMillis] = None   # omitted -> now
+    status: PresenceStatus = "PRESENT"         # ABSENT / LEAVE are rejected (422)
 
 
 # --------------------------------------------------------------------------- #
@@ -249,6 +254,45 @@ def employee_out(doc: dict) -> dict:
         "joined_on": doc["joined_on"],
         "created_at": dt_to_ms(doc.get("created_at")),
     }
+
+
+def _api_value(value):
+    """history 'from'/'to' values: datetimes become epoch ms, others unchanged."""
+    return dt_to_ms(value) if isinstance(value, datetime) else value
+
+
+def history_out(entry: dict) -> dict:
+    return {
+        "at": dt_to_ms(entry.get("at")),
+        "by": entry.get("by"),
+        "reason": entry.get("reason"),
+        "changes": {
+            field: {"from": _api_value(change.get("from")), "to": _api_value(change.get("to"))}
+            for field, change in (entry.get("changes") or {}).items()
+        },
+    }
+
+
+def record_out(doc: dict) -> dict:
+    """An attendance record in API shape. Legacy documents may lack history,
+    half_day, late_minutes or overtime_minutes: treat them as [], False, 0, 0."""
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": dt_to_ms(doc.get("punch_in")),
+        "punch_out": dt_to_ms(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes") or 0,
+        "overtime_minutes": doc.get("overtime_minutes") or 0,
+        "half_day": bool(doc.get("half_day", False)),
+        "history": [history_out(h) for h in (doc.get("history") or [])],
+    }
+
+
+def validation_error(field: str, location: str, message: str, value) -> RequestValidationError:
+    """A 422 with FastAPI's standard body, for checks that span two fields."""
+    return RequestValidationError([{"type": "value_error", "loc": [location, field], "msg": message, "input": value}])
 
 
 # --------------------------------------------------------------------------- #
@@ -290,59 +334,75 @@ def list_employees(department: Optional[str] = None, page: Page = 1, page_size: 
     return {"items": [employee_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
-# ----- STARTER endpoints below - not reviewed yet --------------------------- #
 @app.post("/attendance/punch-in", status_code=201)
-def punch_in(body: PunchInIn):
+def punch_in(body: PunchInRequest):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if emp is None:
+        raise HTTPException(status_code=404, detail="employee not found")
+
+    instant = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
+    punched = truncate_to_second(instant)                                   # R1
+    att_date = attendance_date(punched, emp["shift_start"], emp["shift_end"])  # R1
+
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": att_date.isoformat(),
         "status": body.status,
-        "punch_in": ts,
+        "punch_in": punched,
         "punch_out": None,
-        "work_hours": None,
-        "late_minutes": 0,  # TEMP: starter punch-in is rewritten in a later step
-        "overtime_minutes": 0,
-        "half_day": False,
+        **derived_fields(body.status, punched, None, att_date, emp),  # R2; others start empty
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        # Race-safe: the unique (emp_code, date) index lets exactly one insert win.
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="already punched in for this date")
+    return record_out(doc)
+
+
+ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
+
+
+def build_attendance_filter(emp_code: Optional[str], date_from: Optional[str],
+                            date_to: Optional[str], status: Optional[str]) -> dict:
+    """Shared by GET /attendance and its explain, so both run the same query."""
+    query: dict = {}
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        query["date"] = {}
+        if date_from is not None:
+            query["date"]["$gte"] = date_from   # YYYY-MM-DD strings sort like dates
+        if date_to is not None:
+            query["date"]["$lte"] = date_to
+    if status is not None:
+        query["status"] = status
+    return query
 
 
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    page: Page = 1,
+    page_size: PageSize = 20,
 ):
-    q = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    if date_from and date_to and date_from > date_to:
+        raise validation_error("date_from", "query", "date_from must not be after date_to", date_from)
+    query = build_attendance_filter(emp_code, date_from, date_to, status)
+    total = db.attendance_logs.count_documents(query)
+    # Sorting, skipping and limiting happen in MongoDB on an index -
+    # the collection is never loaded into memory.
+    cursor = (
+        db.attendance_logs.find(query)
+        .sort(ATTENDANCE_SORT)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #

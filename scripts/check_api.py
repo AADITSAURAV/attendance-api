@@ -12,6 +12,7 @@ import sys
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
 
 BASE = "http://127.0.0.1:8000"
 failures = 0
@@ -42,6 +43,21 @@ def check(label, got, expected):
 
 RUN = random.randint(10000, 99999)          # makes this run's data unique
 DEPT = f"QA-{RUN}"
+IST = timezone(timedelta(hours=5, minutes=30))
+# A run-specific block of calendar days far in the future, so filters by date
+# only ever see this run's records. BASE_DAY is a Monday.
+BASE_DAY = date(2040, 1, 2) + timedelta(weeks=RUN % 2500)
+
+
+def day(n):
+    """BASE_DAY + n days, as a date."""
+    return BASE_DAY + timedelta(days=n)
+
+
+def ist_ms(d, hh, mm, ss=0, ms=0):
+    """Epoch milliseconds of an IST wall-clock time on date d."""
+    dt = datetime(d.year, d.month, d.day, hh, mm, ss, ms * 1000, tzinfo=IST)
+    return int(dt.timestamp()) * 1000 + ms
 
 
 def emp_code(n):
@@ -109,6 +125,88 @@ status, body = call("GET", "/employees?page=1&page_size=20")
 check("page 1 is not empty", len(body.get("items", [])) > 0, True)
 check("page=0 -> 422", call("GET", "/employees?page=0")[0], 422)
 check("page_size=101 -> 422", call("GET", "/employees?page_size=101")[0], 422)
+
+# --------------------------------------------------------------------------- #
+print("--- POST /attendance/punch-in ---")
+DAY_EMP, NIGHT_EMP = code_a, code_night            # created above (09:30-18:30 and 22:00-06:00)
+RECORD_FIELDS = sorted(["emp_code", "date", "status", "punch_in", "punch_out", "work_hours",
+                        "late_minutes", "overtime_minutes", "half_day", "history"])
+
+status, rec = call("POST", "/attendance/punch-in",
+                   {"emp_code": DAY_EMP, "punched_at": ist_ms(day(0), 10, 15, 59, 900)})
+check("punch-in -> 201", status, 201)
+check("record fields (no id/_id)", sorted(rec) if isinstance(rec, dict) else rec, RECORD_FIELDS)
+check("R1 date is the IST date", rec.get("date"), day(0).isoformat())
+check("R1 punch_in truncated to whole seconds", rec.get("punch_in"), ist_ms(day(0), 10, 15, 59))
+check("R2 late 10:15:59 -> 45", rec.get("late_minutes"), 45)
+check("defaults: status/punch_out/work_hours/overtime/half_day/history",
+      [rec.get(k) for k in ("status", "punch_out", "work_hours", "overtime_minutes", "half_day", "history")],
+      ["PRESENT", None, None, 0, False, []])
+
+check("second punch-in same day -> 409",
+      call("POST", "/attendance/punch-in", {"emp_code": DAY_EMP, "punched_at": ist_ms(day(0), 11, 0)})[0], 409)
+check("unknown employee -> 404",
+      call("POST", "/attendance/punch-in", {"emp_code": "EMP000000", "punched_at": ist_ms(day(0), 9, 0)})[0], 404)
+
+bad_punches = {
+    "status ABSENT": {"emp_code": DAY_EMP, "status": "ABSENT"},
+    "status LEAVE": {"emp_code": DAY_EMP, "status": "LEAVE"},
+    "punched_at in seconds": {"emp_code": DAY_EMP, "punched_at": ist_ms(day(1), 9, 0) // 1000},
+    "punched_at float": {"emp_code": DAY_EMP, "punched_at": float(ist_ms(day(1), 9, 0))},
+    "punched_at string": {"emp_code": DAY_EMP, "punched_at": str(ist_ms(day(1), 9, 0))},
+    "punched_at boolean": {"emp_code": DAY_EMP, "punched_at": True},
+    "punched_at beyond 2100": {"emp_code": DAY_EMP, "punched_at": 4_102_444_800_001},
+    "missing emp_code": {"punched_at": ist_ms(day(1), 9, 0)},
+}
+for label, payload in bad_punches.items():
+    check(f"{label} -> 422", call("POST", "/attendance/punch-in", payload)[0], 422)
+
+status, rec = call("POST", "/attendance/punch-in",
+                   {"emp_code": DAY_EMP, "punched_at": ist_ms(day(1), 9, 40, 0), "status": "WFH"})
+check("WFH at 09:40:00 -> 201, late 0", (status, rec.get("status"), rec.get("late_minutes")), (201, "WFH", 0))
+
+status, rec = call("POST", "/attendance/punch-in",
+                   {"emp_code": NIGHT_EMP, "punched_at": ist_ms(day(1), 1, 0)})
+check("night shift 01:00 belongs to previous day (R1)", (status, rec.get("date")), (201, day(0).isoformat()))
+check("night shift 01:00 late 180 min (R2)", rec.get("late_minutes"), 180)
+
+print("--- concurrent punch-ins ---")
+code_race2 = emp_code(5)
+call("POST", "/employees", new_employee(code_race2))
+with ThreadPoolExecutor(max_workers=10) as pool:
+    statuses = sorted(pool.map(lambda _: call("POST", "/attendance/punch-in",
+                                              {"emp_code": code_race2, "punched_at": ist_ms(day(2), 9, 0)})[0],
+                               range(10)))
+check("10 parallel punch-ins: one 201, nine 409", statuses, [201] + [409] * 9)
+
+# --------------------------------------------------------------------------- #
+print("--- GET /attendance ---")
+status, body = call("GET", f"/attendance?emp_code={DAY_EMP}")
+check("filter by emp_code -> 2 records", (status, body.get("total")), (200, 2))
+check("sorted by date descending", [r["date"] for r in body.get("items", [])],
+      [day(1).isoformat(), day(0).isoformat()])
+
+d0 = day(0).isoformat()
+status, body = call("GET", f"/attendance?date_from={d0}&date_to={d0}")
+check("one day -> both employees", body.get("total"), 2)
+check("same date sorted by emp_code ascending", [r["emp_code"] for r in body.get("items", [])],
+      sorted([DAY_EMP, NIGHT_EMP]))
+status, body = call("GET", f"/attendance?date_from={d0}&date_to={day(2).isoformat()}&status=WFH")
+check("status filter WFH -> 1", body.get("total"), 1)
+status, body = call("GET", f"/attendance?date_from={d0}&date_to={day(2).isoformat()}&page=2&page_size=2")
+check("page 2 of 4 records, size 2 -> 2 items, total 4", (len(body.get("items", [])), body.get("total")), (2, 4))
+
+check("date_from after date_to -> 422",
+      call("GET", f"/attendance?date_from={day(2).isoformat()}&date_to={d0}")[0], 422)
+check("invalid date 2026-13-01 -> 422", call("GET", "/attendance?date_from=2026-13-01")[0], 422)
+check("unknown status -> 422", call("GET", "/attendance?status=HOLIDAY")[0], 422)
+check("page_size=101 -> 422", call("GET", "/attendance?page_size=101")[0], 422)
+
+status, body = call("GET", "/attendance?emp_code=EMP0002&date_from=2026-07-14&date_to=2026-07-14")
+if body.get("total") == 1:  # only when the kit's sample data is loaded
+    legacy = body["items"][0]
+    check("legacy record: missing history -> [], half_day -> false",
+          (legacy["history"], legacy["half_day"]), ([], False))
 
 # --------------------------------------------------------------------------- #
 print()
