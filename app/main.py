@@ -9,13 +9,14 @@ import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Optional
+import re
+from typing import Annotated, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import AfterValidator, BaseModel, Field, StrictInt, model_validator
 from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -187,22 +188,67 @@ def derived_fields(status: str, punch_in: Optional[datetime], punch_out: Optiona
 
 
 # --------------------------------------------------------------------------- #
-# Models  (STARTER - not reviewed yet)
+# Validated types and request models
 # --------------------------------------------------------------------------- #
-class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+def _check_date(value: str) -> str:
+    """YYYY-MM-DD and a real calendar date (2026-02-30 is rejected)."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("must be a date in YYYY-MM-DD format")
+    date.fromisoformat(value)  # raises ValueError for impossible dates
+    return value
 
 
-class PunchInIn(BaseModel):
+# StrictInt: rejects floats (1.7e12), strings ("1783312500000") and booleans.
+# The range rejects values that look like seconds (< 100000000000).
+EpochMillis = Annotated[StrictInt, Field(ge=100_000_000_000, le=4_102_444_800_000)]
+DateStr = Annotated[str, AfterValidator(_check_date)]
+HHMM = Annotated[str, Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]
+Page = Annotated[int, Query(ge=1)]                    # R10: page starts at 1
+PageSize = Annotated[int, Query(ge=1, le=100)]        # R10: max 100
+
+
+class EmployeeCreate(BaseModel):
+    emp_code: Annotated[str, Field(pattern=r"^EMP\d{4,6}$")]
+    name: Annotated[str, Field(min_length=1, max_length=100)]
+    email: Annotated[str, Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")]
+    department: Annotated[str, Field(min_length=1, max_length=50)]
+    shift_start: HHMM = "09:30"
+    shift_end: HHMM = "18:30"
+    joined_on: DateStr
+
+    @model_validator(mode="after")
+    def _shift_times_differ(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
+
+
+class PunchInIn(BaseModel):  # STARTER - not reviewed yet
     emp_code: str
     punched_at: Optional[int] = None
     status: str = "PRESENT"
+
+
+# --------------------------------------------------------------------------- #
+# Response serializers - build the API shape explicitly (never leak _id)
+# --------------------------------------------------------------------------- #
+def now_utc() -> datetime:
+    """Current time, cut to whole milliseconds (what BSON can store)."""
+    now = datetime.now(timezone.utc)
+    return now.replace(microsecond=now.microsecond // 1000 * 1000)
+
+
+def employee_out(doc: dict) -> dict:
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc["name"],
+        "email": doc["email"],
+        "department": doc["department"],
+        "shift_start": doc["shift_start"],
+        "shift_end": doc["shift_end"],
+        "joined_on": doc["joined_on"],
+        "created_at": dt_to_ms(doc.get("created_at")),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -218,29 +264,33 @@ def health():
     return {"status": "ok"}
 
 
-# ----- STARTER endpoints below - not reviewed yet --------------------------- #
 @app.post("/employees", status_code=201)
-def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
+def create_employee(body: EmployeeCreate):
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = now_utc()
+    try:
+        # No check-then-insert: the unique index decides, so two concurrent
+        # creates with the same emp_code give exactly one 201 and one 409.
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="emp_code already exists")
+    return employee_out(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
-    q = {}
-    if department:
-        q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+def list_employees(department: Optional[str] = None, page: Page = 1, page_size: PageSize = 20):
+    query = {} if department is None else {"department": department}
+    total = db.employees.count_documents(query)  # R10: total reflects the filter
+    cursor = (
+        db.employees.find(query)
+        .sort("emp_code", ASCENDING)
+        .skip((page - 1) * page_size)            # page 1 skips nothing
+        .limit(page_size)
+    )
+    return {"items": [employee_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
+# ----- STARTER endpoints below - not reviewed yet --------------------------- #
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
