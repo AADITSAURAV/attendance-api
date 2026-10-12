@@ -1,11 +1,11 @@
 # DECISIONS.md
 
-1. **Indexes.** `employees`: unique `emp_code` (race-safe creates, lookups) and `department + joined_on` / `joined_on` (headcount, trend, summary). `attendance_logs`: unique `emp_code + date` (one record per day; race-safe punch-in, monthly, `$lookup`s), `emp_code + punch_in` (punch-out finds the latest punch-in), `date + emp_code` (list sort, month ranges for the leaderboard), `status + date + emp_code` (status-filtered list). I rejected an index on `late_minutes`: the leaderboard already narrows by date first.
+1. **Indexes.** Indexes make MongoDB find records fast without scanning the whole collection. The most important ones are the unique `emp_code` index on employees and the unique `emp_code + date` index on attendance_logs, which prevents duplicate daily attendance. I also added date-based indexes (`date + emp_code`, `status + date + emp_code`) for the attendance list and the month-range analytics, `emp_code + punch_in` so punch-out can find the latest punch-in quickly, and `department + joined_on` for headcount and the trend. I considered an index on `late_minutes` for the leaderboard and rejected it: the query already narrows by date first, so it would only slow down writes.
 
-2. **Punch-in race.** Both requests compute the same `(emp_code, date)` and call `insert_one` - there is no check-then-insert. MongoDB enforces the unique index atomically: one insert succeeds (201), the other raises `DuplicateKeyError`, which I return as 409.
+2. **Punch-in race.** If two identical punch-ins arrive at the same time, MongoDB's unique `(emp_code, date)` index allows only one insert to succeed. The other gets a duplicate-key error, which I return as 409, so we never create duplicate attendance records. I do not check first and then insert, because two requests could both pass the check.
 
-3. **Ties.** `$setWindowFields` with `$rank` gives standard competition ranks (1, 2, 2, 4). I filter `rank <= limit` after ranking, so everyone tied at the cutoff is returned - the list can be longer than `limit`. Tied rows are ordered by `emp_code`.
+3. **Ties.** The leaderboard ranks by total late minutes. If two employees are tied at the cutoff, I return everyone tied at that rank rather than arbitrarily dropping one, so the list can be longer than `limit`. Ranks follow standard competition ranking (1, 2, 2, 4) using `$rank`, and tied rows are ordered by `emp_code`.
 
-4. **Headcount.** The pipeline starts from `employees` (`joined_on <= month end`) and `$lookup`s the month's logs, so an employee with zero logs still contributes 1 to headcount with zero totals.
+4. **Headcount.** Headcount comes from the employees collection, not from attendance records. The pipeline starts from employees who joined by the end of the month and uses `$lookup` into attendance, so an employee with zero records is still counted, just with zero totals.
 
-5. **100x data.** Pre-aggregate daily per-department counters on each write (or nightly), so analytics read a few hundred summary rows instead of scanning millions of logs.
+5. **100x data.** I would first review the aggregation pipelines and indexes with explain, then pre-aggregate / materialize analytics (for example daily attendance summaries per department) so we don't repeatedly scan huge attendance data on every request.
